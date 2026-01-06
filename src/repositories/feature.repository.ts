@@ -8,6 +8,7 @@ import {
   DuplicateFeatureError,
   FeatureNotFoundError,
 } from "../domain/errors";
+import { RedisCache } from "../cache/redis-cache";
 
 /**
  * Repository interface for feature flag data access
@@ -28,9 +29,12 @@ export interface IFeatureRepository {
 }
 
 /**
- * MongoDB implementation of the feature repository
+ * MongoDB implementation of the feature repository with Redis caching
  */
 export class FeatureRepository implements IFeatureRepository {
+  private readonly CACHE_KEY_PREFIX = "feature:";
+
+  constructor(private cache: RedisCache) {}
   /**
    * Convert MongoDB document to domain entity
    */
@@ -80,11 +84,49 @@ export class FeatureRepository implements IFeatureRepository {
 
   /**
    * Find a feature flag by key
+   * Implements cache-aside pattern: check cache → DB on miss → update cache
    */
   async findByKey(key: string): Promise<FeatureFlag | null> {
     try {
+      // Try cache first
+      const cacheKey = this.CACHE_KEY_PREFIX + key;
+      const cached = await this.cache.get(cacheKey);
+
+      if (cached) {
+        // Cache hit - parse and return
+        const feature = JSON.parse(cached);
+        // Restore Map objects from plain objects
+        feature.overrides.users = new Map(
+          Object.entries(feature.overrides.users || {})
+        );
+        feature.overrides.groups = new Map(
+          Object.entries(feature.overrides.groups || {})
+        );
+        feature.overrides.regions = new Map(
+          Object.entries(feature.overrides.regions || {})
+        );
+        return feature;
+      }
+
+      // Cache miss - fetch from database
       const doc = await FeatureFlagModel.findOne({ key }).exec();
-      return doc ? this.toDomain(doc) : null;
+      const feature = doc ? this.toDomain(doc) : null;
+
+      // Store in cache if found
+      if (feature) {
+        // Convert Maps to plain objects for JSON serialization
+        const cacheableFeature = {
+          ...feature,
+          overrides: {
+            users: Object.fromEntries(feature.overrides.users),
+            groups: Object.fromEntries(feature.overrides.groups),
+            regions: Object.fromEntries(feature.overrides.regions || new Map()),
+          },
+        };
+        await this.cache.set(cacheKey, JSON.stringify(cacheableFeature));
+      }
+
+      return feature;
     } catch (error: any) {
       throw new DatabaseError("Failed to find feature flag", error);
     }
@@ -104,6 +146,7 @@ export class FeatureRepository implements IFeatureRepository {
 
   /**
    * Update the global enabled state of a feature
+   * Invalidates cache after update
    */
   async updateGlobalState(key: string, enabled: boolean): Promise<void> {
     try {
@@ -115,6 +158,9 @@ export class FeatureRepository implements IFeatureRepository {
       if (result.matchedCount === 0) {
         throw new FeatureNotFoundError(key);
       }
+
+      // Invalidate cache
+      await this.cache.delete(this.CACHE_KEY_PREFIX + key);
     } catch (error: any) {
       if (error instanceof FeatureNotFoundError) {
         throw error;
@@ -125,6 +171,7 @@ export class FeatureRepository implements IFeatureRepository {
 
   /**
    * Add or update an override for a feature
+   * Invalidates cache after update
    */
   async addOrUpdateOverride(
     key: string,
@@ -142,6 +189,9 @@ export class FeatureRepository implements IFeatureRepository {
       if (result.matchedCount === 0) {
         throw new FeatureNotFoundError(key);
       }
+
+      // Invalidate cache
+      await this.cache.delete(this.CACHE_KEY_PREFIX + key);
     } catch (error: any) {
       if (error instanceof FeatureNotFoundError) {
         throw error;
@@ -152,6 +202,7 @@ export class FeatureRepository implements IFeatureRepository {
 
   /**
    * Remove an override from a feature
+   * Invalidates cache after removal
    */
   async removeOverride(
     key: string,
@@ -168,6 +219,9 @@ export class FeatureRepository implements IFeatureRepository {
       if (result.matchedCount === 0) {
         throw new FeatureNotFoundError(key);
       }
+
+      // Invalidate cache
+      await this.cache.delete(this.CACHE_KEY_PREFIX + key);
     } catch (error: any) {
       if (error instanceof FeatureNotFoundError) {
         throw error;
@@ -178,6 +232,7 @@ export class FeatureRepository implements IFeatureRepository {
 
   /**
    * Delete a feature flag
+   * Invalidates cache after deletion
    */
   async delete(key: string): Promise<void> {
     try {
@@ -186,6 +241,9 @@ export class FeatureRepository implements IFeatureRepository {
       if (result.deletedCount === 0) {
         throw new FeatureNotFoundError(key);
       }
+
+      // Invalidate cache
+      await this.cache.delete(this.CACHE_KEY_PREFIX + key);
     } catch (error: any) {
       if (error instanceof FeatureNotFoundError) {
         throw error;

@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import Database from "./database/database";
+import { RedisCache } from "./cache/redis-cache";
 import { FeatureRepository } from "./repositories/feature.repository";
 import { FeatureService } from "./services/feature.service";
 import { FeatureController } from "./api/controllers/feature.controller";
@@ -20,7 +21,9 @@ app.use((req: Request, res: Response, next) => {
   next();
 });
 
-const featureRepository = new FeatureRepository();
+// Initialize cache and repository
+const redisCache = new RedisCache();
+const featureRepository = new FeatureRepository(redisCache);
 const featureService = new FeatureService(featureRepository);
 const featureController = new FeatureController(featureService);
 
@@ -36,10 +39,15 @@ app.get("/", (req: Request, res: Response) => {
   });
 });
 
-app.get("/health", (req: Request, res: Response) => {
+app.get("/health", async (req: Request, res: Response) => {
+  const cacheStats = await redisCache.getStats();
   res.json({
     status: "healthy",
     database: Database.getConnectionStatus() ? "connected" : "disconnected",
+    cache: {
+      enabled: cacheStats.enabled,
+      connected: cacheStats.connected,
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -53,7 +61,12 @@ app.use(errorHandler);
 // Start server
 async function startServer() {
   try {
+    // Connect to database
     await Database.connect();
+
+    // Connect to cache (non-blocking - will gracefully degrade if fails)
+    await redisCache.connect();
+
     app.listen(PORT, () => {
       console.log(`🚀 Server running on http://localhost:${PORT}`);
     });
@@ -62,5 +75,13 @@ async function startServer() {
     process.exit(1);
   }
 }
+
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, shutting down gracefully...");
+  await redisCache.disconnect();
+  await Database.disconnect();
+  process.exit(0);
+});
 
 startServer();
